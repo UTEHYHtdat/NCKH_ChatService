@@ -1,25 +1,18 @@
 const { Router } = require('express');
-// Đảm bảo các file middleware, repository, service này cũng đã được chuyển sang .js hoặc export dạng CommonJS
 const { authMiddleware } = require('../middleware/auth.middleware');
-const {
-  ConversationRepository,
-} = require('../repositories/conversation.repositories');
+const { ConversationRepository } = require('../repositories/conversation.repositories');
 const { messageService } = require('../services/message.service');
 
 const router = Router();
 
-// Áp dụng middleware xác thực cho tất cả các route bên dưới
+// Áp dụng middleware xác thực JWT cho tất cả các route
 router.use(authMiddleware);
 
-// GET /conversations — Lấy danh sách conversation của user
+// GET /conversations — Lấy danh sách conversation của user hiện tại
 router.get('/', async (req, res) => {
   try {
-    // req.user được đính kèm từ authMiddleware
-    // const userId = req.user.userId;
-    const userId = 1;
-    console.log(
-      `[ConversationController] Fetching conversations for user ${userId}`,
-    );
+    const userId = req.user.userId; // Lấy từ JWT đã verify bởi authMiddleware
+    console.log(`[ConversationController] Fetching conversations for user ${userId}`);
     const conversations = await ConversationRepository.getByUserId(userId);
     res.json(conversations);
   } catch (err) {
@@ -28,23 +21,19 @@ router.get('/', async (req, res) => {
   }
 });
 
-// GET /conversations/:id/messages — Load tin nhắn gần nhất (Phân trang bằng cursor)
 router.get('/:id/messages', async (req, res) => {
   try {
     const conversationId = parseInt(req.params.id, 10);
     const userId = req.user.userId;
 
-    // Nếu có cursor trên query string thì parse thành số nguyên, không thì để undefined
-    const cursor = req.query.cursor
-      ? parseInt(req.query.cursor, 10)
-      : undefined;
+    if (isNaN(conversationId) || conversationId <= 0) {
+      return res.status(400).json({ message: 'Invalid conversation ID' });
+    }
 
-    const messages = await messageService.getMessages(
-      conversationId,
-      userId,
-      cursor,
-    );
-    res.json(messages);
+    const cursor = req.query.cursor ? parseInt(req.query.cursor, 10) : undefined;
+
+    const result = await messageService.getMessages(conversationId, userId, cursor);
+    res.json(result);
   } catch (err) {
     console.error('Error fetching messages:', err);
     const errorMessage = err instanceof Error ? err.message : 'Error';
@@ -52,13 +41,16 @@ router.get('/:id/messages', async (req, res) => {
   }
 });
 
-// POST /conversations/:id/messages — Gửi tin nhắn qua HTTP
+// POST /conversations/:id/messages — Gửi tin nhắn qua HTTP (fallback khi mất socket)
 router.post('/:id/messages', async (req, res) => {
   try {
     const conversationId = parseInt(req.params.id, 10);
-    // const userId = req.user.userId;
-    const userId = 2;
+    const userId = req.user.userId; // Lấy từ JWT đã verify — KHÔNG hardcode
     const content = req.body?.content;
+
+    if (isNaN(conversationId) || conversationId <= 0) {
+      return res.status(400).json({ message: 'Invalid conversation ID' });
+    }
 
     if (typeof content !== 'string' || content.trim().length === 0) {
       return res.status(400).json({ message: 'Message content is required' });
@@ -70,12 +62,13 @@ router.post('/:id/messages', async (req, res) => {
       content,
     });
 
+    // Emit socket event nếu io đang chạy (dual delivery: HTTP + Socket)
     const io = req.app.locals.io;
     if (io) {
       io.to(`conversation:${conversationId}`).emit('newMessage', {
         id: result.message.id,
         conversationId,
-        sender: result.message.sender,
+        sender: result.message.users,
         content: result.message.content,
         createdAt: result.message.created_at,
       });
@@ -93,5 +86,4 @@ router.post('/:id/messages', async (req, res) => {
   }
 });
 
-// Export router theo chuẩn Node.js CommonJS
 module.exports = router;
