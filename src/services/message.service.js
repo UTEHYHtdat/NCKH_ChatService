@@ -12,7 +12,8 @@ class MessageService {
    * 6. Return message để Socket emit
    */
   async sendMessage(params) {
-    const { conversationId, senderId, content } = params;
+    const { conversationId, senderId, content, parentMessageId, attachments } = params;
+    let { mentionedUserIds } = params;
 
     // Kiểm tra quyền truy cập
     const conversation = await ConversationRepository.findByIdAndUser(
@@ -31,11 +32,24 @@ class MessageService {
       throw new Error('Message too long (max 5000 characters)');
     }
 
+    // Extract mentioned users if not explicitly provided
+    if (!mentionedUserIds || !Array.isArray(mentionedUserIds)) {
+      mentionedUserIds = [];
+      const mentionRegex = /@\[.*?\]\((\d+)\)/g;
+      let match;
+      while ((match = mentionRegex.exec(content)) !== null) {
+        mentionedUserIds.push(parseInt(match[1], 10));
+      }
+    }
+
     // Tạo message (bao gồm cập nhật last_message_at trong transaction)
     const message = await MessageRepository.create({
       conversationId,
       senderId,
       content: content.trim(),
+      parentMessageId,
+      attachments,
+      mentionedUserIds,
     });
 
     // Đánh dấu đã đọc cho sender ngay khi gửi
@@ -48,6 +62,29 @@ class MessageService {
       message,
       memberIds: conversation.conversation_members.map((m) => m.user_id),
     };
+  }
+
+  /**
+   * Chỉnh sửa tin nhắn
+   */
+  async editMessage({ messageId, senderId, newContent }) {
+    if (!newContent || newContent.trim().length === 0) {
+      throw new Error('Message content cannot be empty');
+    }
+    if (newContent.length > 5000) {
+      throw new Error('Message too long (max 5000 characters)');
+    }
+
+    const message = await MessageRepository.editMessage(messageId, senderId, newContent.trim());
+    return message;
+  }
+
+  /**
+   * Xóa tin nhắn (soft delete)
+   */
+  async deleteMessage({ messageId, userId }) {
+    const message = await MessageRepository.softDeleteMessage(messageId, userId);
+    return message;
   }
 
   /**

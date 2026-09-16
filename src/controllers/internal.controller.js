@@ -159,4 +159,91 @@ router.get('/conversations/thesis/:thesisId', requireInternalKey, async (req, re
   }
 });
 
+/**
+ * POST /api/v1/chatbox/internal/conversations/ticket
+ * Tạo conversation trao đổi hỗ trợ cho ticket học vụ
+ */
+router.post('/conversations/ticket', requireInternalKey, async (req, res) => {
+  const { ticketId, ticketCode, title, createdByUserId, memberUserIds } = req.body;
+
+  if (!ticketId || !createdByUserId || !Array.isArray(memberUserIds) || memberUserIds.length === 0) {
+    return res.status(400).json({
+      message: 'Thiếu thông tin: ticketId, createdByUserId, memberUserIds là bắt buộc',
+    });
+  }
+
+  try {
+    const existing = await prisma.conversations.findFirst({
+      where: { ticket_id: ticketId, is_active: true },
+      select: { id: true },
+    });
+
+    if (existing) {
+      return res.status(200).json({
+        success: true,
+        conversationId: existing.id,
+        alreadyExists: true
+      });
+    }
+
+    let convType = await prisma.conversation_types.findUnique({
+      where: { type_code: 'TICKET_CHAT' },
+    });
+
+    if (!convType) {
+      convType = await prisma.conversation_types.create({
+        data: {
+          type_code: 'TICKET_CHAT',
+          type_name: 'Hỗ trợ yêu cầu học vụ',
+          description: 'Nhóm trao đổi xử lý yêu cầu/ticket học vụ',
+          status: true,
+        },
+      });
+    }
+
+    const conversation = await prisma.$transaction(async (tx) => {
+      const conv = await tx.conversations.create({
+        data: {
+          conversation_type_id: convType.id,
+          conversation_name: `[${ticketCode || `REQ-${ticketId}`}] ${title || 'Yêu cầu hỗ trợ'}`,
+          created_by_id: createdByUserId,
+          ticket_id: ticketId,
+          is_active: true,
+        },
+      });
+
+      const uniqueIds = [...new Set(memberUserIds.map(Number))];
+
+      await tx.conversation_members.createMany({
+        data: uniqueIds.map((userId) => ({
+          conversation_id: conv.id,
+          user_id: userId,
+          role: userId === createdByUserId ? 'ADMIN' : 'MEMBER',
+          is_active: true,
+          unread_count: 0,
+        })),
+        skipDuplicates: true,
+      });
+
+      return conv;
+    });
+
+    console.log(`[Internal] ✅ Tạo chat cho ticket #${ticketId} → conversation #${conversation.id}`);
+
+    return res.status(201).json({
+      success: true,
+      conversationId: conversation.id,
+      ticketId,
+      memberCount: memberUserIds.length,
+    });
+  } catch (err) {
+    console.error('[Internal] Lỗi tạo ticket conversation:', err);
+    return res.status(500).json({
+      message: 'Không thể tạo ticket conversation',
+      error: err.message,
+    });
+  }
+});
+
 module.exports = router;
+

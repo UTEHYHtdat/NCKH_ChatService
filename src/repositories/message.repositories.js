@@ -24,6 +24,7 @@ const MessageRepository = {
           sender_id: dto.senderId,
           message_type_id: dto.messageTypeId || 1, // 1 = TEXT
           content: encryptedContent, // ← lưu bản MÃ HÓA vào DB
+          ...(dto.parentMessageId && { parent_message_id: dto.parentMessageId })
         },
         include: {
           users: {
@@ -43,9 +44,72 @@ const MessageRepository = {
         data: { last_message_at: new Date() },
       });
 
+      let parentMessage = null;
+      if (dto.parentMessageId) {
+        const parent = await tx.messages.findUnique({
+          where: { id: dto.parentMessageId },
+          select: {
+            id: true,
+            content: true,
+            sender_id: true,
+            users: { select: { id: true, full_name: true } },
+          },
+        });
+        if (parent) {
+          parentMessage = {
+            ...parent,
+            content: decryptMessage(parent.content),
+          };
+        }
+      }
+
+      let createdAttachments = [];
+      if (dto.attachments && dto.attachments.length > 0) {
+        await tx.message_attachments.createMany({
+          data: dto.attachments.map((att) => ({
+            message_id: message.id,
+            file_name: att.fileName,
+            file_path: att.filePath,
+            file_type: att.fileType,
+            file_size: att.fileSize ? BigInt(att.fileSize) : null,
+            thumbnail_path: att.thumbnailPath,
+          })),
+        });
+        const atts = await tx.message_attachments.findMany({
+          where: { message_id: message.id },
+        });
+        createdAttachments = atts.map((a) => ({
+          ...a,
+          file_size: a.file_size ? Number(a.file_size) : null,
+        }));
+      }
+
+      let createdMentions = [];
+      if (dto.mentionedUserIds && dto.mentionedUserIds.length > 0) {
+        await tx.message_mentions.createMany({
+          data: dto.mentionedUserIds.map((userId) => ({
+            message_id: message.id,
+            mentioned_user_id: userId,
+          })),
+          skipDuplicates: true,
+        });
+        createdMentions = await tx.message_mentions.findMany({
+          where: { message_id: message.id },
+          include: {
+            users: {
+              select: { id: true, full_name: true, avatar: true },
+            },
+          },
+        });
+      }
+
       return {
         ...message,
         content: dto.content, // ← trả về plain text cho socket emit (KHÔNG trả ciphertext)
+        parentMessage,
+        message_attachments: createdAttachments,
+        message_mentions: createdMentions,
+        message_reactions: [],
       };
     });
   },
@@ -90,6 +154,46 @@ const MessageRepository = {
             read_at: true,
           },
         },
+        message_attachments: {
+          select: {
+            id: true,
+            file_name: true,
+            file_path: true,
+            file_type: true,
+            file_size: true,
+            thumbnail_path: true,
+          },
+        },
+        message_reactions: {
+          select: {
+            id: true,
+            user_id: true,
+            reaction_type: true,
+            reaction_icon: true,
+            users: {
+              select: { id: true, full_name: true, avatar: true },
+            },
+          },
+        },
+        message_mentions: {
+          select: {
+            id: true,
+            mentioned_user_id: true,
+            users: {
+              select: { id: true, full_name: true, avatar: true },
+            },
+          },
+        },
+        messages: {
+          select: {
+            id: true,
+            content: true,
+            sender_id: true,
+            users: {
+              select: { id: true, full_name: true },
+            },
+          },
+        },
       },
     });
 
@@ -101,13 +205,81 @@ const MessageRepository = {
     const nextCursor = hasMore && data.length > 0 ? data[data.length - 1].id : null;
 
     return {
-      messages: data.reverse().map((msg) => ({
-        ...msg,
-        content: decryptMessage(msg.content), // ← giải mã khi đọc từ DB
-      })),
+      messages: data.reverse().map((msg) => {
+        // Giải mã nội dung tin nhắn gốc đang được reply (nếu có)
+        let parentMessage = msg.messages; // self-relation: parent message
+        if (parentMessage) {
+          parentMessage = {
+            ...parentMessage,
+            content: decryptMessage(parentMessage.content),
+          };
+        }
+        return {
+          ...msg,
+          content: msg.is_deleted ? msg.content : decryptMessage(msg.content), // ← giải mã khi đọc từ DB
+          parentMessage, // Đổi tên field cho FE dễ hiểu hơn
+          messages: undefined, // Xóa field tên khó hiểu
+          message_attachments: (msg.message_attachments || []).map((att) => ({
+            ...att,
+            file_size: att.file_size ? Number(att.file_size) : null,
+          })),
+        };
+      }),
       hasMore,
       nextCursor,
     };
+  },
+
+  async editMessage(messageId, senderId, newContent) {
+    const existing = await prisma.messages.findUnique({ where: { id: messageId } });
+    if (!existing || existing.sender_id !== senderId) throw new Error('Not authorized or message not found');
+    
+    const encryptedContent = encryptMessage(newContent);
+    const updated = await prisma.messages.update({
+      where: { id: messageId },
+      data: {
+        content: encryptedContent,
+        is_edited: true,
+        updated_at: new Date()
+      }
+    });
+    
+    return {
+      ...updated,
+      content: newContent
+    };
+  },
+
+  async softDeleteMessage(messageId, userId) {
+    const existing = await prisma.messages.findUnique({ where: { id: messageId } });
+    if (!existing || existing.sender_id !== userId) throw new Error('Not authorized or message not found');
+
+    const updated = await prisma.messages.update({
+      where: { id: messageId },
+      data: {
+        content: encryptMessage('[Tin nhắn đã bị thu hồi]'),
+        is_deleted: true,
+        deleted_at: new Date()
+      }
+    });
+
+    return {
+      ...updated,
+      content: '[Tin nhắn đã bị thu hồi]'
+    };
+  },
+
+  async findById(messageId) {
+    const message = await prisma.messages.findUnique({
+      where: { id: messageId },
+      include: {
+        users: { select: { id: true, username: true, full_name: true, avatar: true } }
+      }
+    });
+    if (message) {
+      message.content = decryptMessage(message.content);
+    }
+    return message;
   },
 
   /**

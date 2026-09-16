@@ -2,6 +2,9 @@ const { verifyToken } = require('../utils/jwt');
 const { UserRepository } = require('../repositories/user.repository');
 const { ConversationRepository } = require('../repositories/conversation.repositories');
 const { messageService } = require('./message.service');
+const { notifyOfflineMembers } = require('../utils/notificationClient');
+const { MessageRepository } = require('../repositories/message.repositories');
+const { ReactionRepository } = require('../repositories/reaction.repository');
 
 // ─── In-memory Socket Tracking ─────────────────────────────────────────────
 // Socket IDs là ephemeral (mất khi server restart) nên không cần lưu DB.
@@ -122,10 +125,13 @@ function initSocketIO(io) {
         const conversationId = parsePositiveInt(data?.conversationId, 'conversationId');
         const content = data?.content;
 
-        const { message } = await messageService.sendMessage({
+        const { message, memberIds } = await messageService.sendMessage({
           conversationId,
           senderId: userId,
           content,
+          parentMessageId: data?.parentMessageId ? parsePositiveInt(data.parentMessageId, 'parentMessageId') : undefined,
+          attachments: data?.attachments,
+          mentionedUserIds: data?.mentionedUserIds,
         });
 
         // Emit tới tất cả thành viên trong conversation room
@@ -135,6 +141,20 @@ function initSocketIO(io) {
           sender: message.users,
           content: message.content,
           createdAt: message.created_at,
+          parentMessage: message.parentMessage || null,
+          attachments: message.message_attachments || [],
+          mentions: message.message_mentions || [],
+          isEdited: message.is_edited || false,
+        });
+
+        // Thông báo cho các thành viên offline
+        notifyOfflineMembers({
+          memberIds,
+          senderId: userId,
+          senderName: socket.fullName || socket.username,
+          conversationId,
+          conversationName: null,
+          messageContent: content,
         });
 
         if (typeof callback === 'function') {
@@ -145,6 +165,103 @@ function initSocketIO(io) {
         if (typeof callback === 'function') {
           callback({ success: false, error: errorMessage });
         }
+      }
+    });
+
+    socket.on('editMessage', async (data, callback) => {
+      try {
+        const messageId = parsePositiveInt(data?.messageId, 'messageId');
+        const newContent = data?.content;
+        
+        const message = await messageService.editMessage({
+          messageId,
+          senderId: userId,
+          newContent,
+        });
+        
+        // Broadcast to all members in the conversation
+        io.to(`conversation:${message.conversation_id}`).emit('messageEdited', {
+          messageId: message.id,
+          conversationId: message.conversation_id,
+          content: message.content,
+          isEdited: true,
+          updatedAt: message.updated_at,
+        });
+        
+        if (typeof callback === 'function') callback({ success: true, message });
+      } catch (err) {
+        const errorMessage = err instanceof Error ? err.message : 'Edit failed';
+        if (typeof callback === 'function') callback({ success: false, error: errorMessage });
+      }
+    });
+
+    socket.on('deleteMessage', async (data, callback) => {
+      try {
+        const messageId = parsePositiveInt(data?.messageId, 'messageId');
+        
+        const message = await messageService.deleteMessage({
+          messageId,
+          userId,
+        });
+        
+        io.to(`conversation:${message.conversation_id}`).emit('messageDeleted', {
+          messageId: message.id,
+          conversationId: message.conversation_id,
+          deletedAt: message.deleted_at,
+        });
+        
+        if (typeof callback === 'function') callback({ success: true });
+      } catch (err) {
+        const errorMessage = err instanceof Error ? err.message : 'Delete failed';
+        if (typeof callback === 'function') callback({ success: false, error: errorMessage });
+      }
+    });
+
+    socket.on('addReaction', async (data, callback) => {
+      try {
+        const messageId = parsePositiveInt(data?.messageId, 'messageId');
+        const { reactionType, reactionIcon } = data;
+        
+        if (!reactionType) throw new Error('Reaction type is required');
+        
+        const reaction = await ReactionRepository.addReaction(messageId, userId, reactionType, reactionIcon || reactionType);
+        
+        // Need to find the conversation for this message to emit to room
+        const message = await MessageRepository.findById(messageId);
+        if (message) {
+          io.to(`conversation:${message.conversation_id}`).emit('reactionAdded', {
+            messageId,
+            conversationId: message.conversation_id,
+            reaction: { ...reaction, users: { id: userId, full_name: socket.fullName } },
+          });
+        }
+        
+        if (typeof callback === 'function') callback({ success: true, reaction });
+      } catch (err) {
+        const errorMessage = err instanceof Error ? err.message : 'Add reaction failed';
+        if (typeof callback === 'function') callback({ success: false, error: errorMessage });
+      }
+    });
+
+    socket.on('removeReaction', async (data, callback) => {
+      try {
+        const messageId = parsePositiveInt(data?.messageId, 'messageId');
+        
+        await ReactionRepository.removeReaction(messageId, userId);
+        
+        const message = await MessageRepository.findById(messageId);
+        if (message) {
+          io.to(`conversation:${message.conversation_id}`).emit('reactionRemoved', {
+            messageId,
+            conversationId: message.conversation_id,
+            userId,
+          });
+        }
+        
+        if (typeof callback === 'function') callback({ success: true });
+      } catch (err) {
+        const errorMessage = err instanceof Error ? err.message : 'Remove reaction failed';
+        if (typeof callback === 'function') callback({ success: false, error: errorMessage });
       }
     });
 
