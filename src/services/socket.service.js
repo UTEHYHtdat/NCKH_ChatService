@@ -281,6 +281,7 @@ function initSocketIO(io) {
       if (!conversationId) return;
       socket.to(`conversation:${conversationId}`).emit('userStopTyping', {
         userId,
+        username: socket.username,
         conversationId,
       });
     });
